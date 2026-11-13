@@ -24,7 +24,7 @@ Profil disimpan di `localStorage` browser, termasuk API key tanpa enkripsi. Guna
 
 ## Menjalankan versi EXE
 
-Jalankan `dist\LLMAvailabilityChecker.exe`, lalu buka `http://127.0.0.1:8000` di browser. Versi ini menyertakan fitur endpoint tersimpan. Tutup aplikasi yang sedang berjalan sebelum mengganti EXE dengan versi baru, lalu jalankan kembali.
+Jalankan `dist\LLMAvailabilityChecker-updated.exe` (versi terbaru), lalu buka `http://127.0.0.1:8000` di browser. Versi ini menyertakan fitur endpoint tersimpan. Tutup aplikasi yang sedang berjalan sebelum mengganti EXE dengan versi baru, lalu jalankan kembali.
 EXE ini tidak membutuhkan instalasi Python atau package tambahan. API hanya menerima request dari localhost; Base URL HTTP hanya diizinkan untuk localhost dan tujuan privat ditolak.
 
 ## Provider lain
@@ -42,7 +42,7 @@ Provider harus mendukung:
 - `GET /models`
 - `POST /chat/completions`
 
-Tombol **Batalkan** menghentikan permintaan aktif dan membatalkan tes model yang belum berjalan; request jaringan yang sedang berlangsung tetap berhenti setelah timeout. Model diuji dengan prompt singkat, `max_tokens: 16`, dan `temperature: 0`. Pengujian memakai concurrency maksimum 10 model agar tidak membebani provider. Hasil awalnya diurutkan dari latency terendah; filter latency maksimum bersifat opsional. Gunakan **Filter nama model** untuk membatasi model yang diuji, dan **Maksimum model** untuk membatasi jumlah model (default 200, maksimum 500).
+Tombol **Batalkan** menghentikan permintaan aktif dan membatalkan tes model yang belum berjalan; request jaringan yang sedang berlangsung tetap berhenti setelah timeout. Model diuji dengan prompt singkat, `max_tokens: 16`, dan `temperature: 0`. Pengujian memakai concurrency maksimum 10 model agar tidak membebani provider. Hasil awalnya diurutkan dari latency terendah; filter latency maksimum bersifat opsional. Gunakan **Filter nama model** untuk membatasi model yang diuji, dan **Maksimum model** untuk membatasi jumlah model (default 200, maksimum 500). Opsi **Hanya model gagal** menyembunyikan model yang sudah READY dari tabel hasil, sehingga hanya model yang gagal yang tampak.
 
 ## Filter dan pengurutan
 
@@ -50,6 +50,7 @@ Tombol **Batalkan** menghentikan permintaan aktif dan membatalkan tes model yang
 - **Hanya model chat** menyembunyikan model yang jelas bukan chat (embedding, image, audio, moderation, dan sejenisnya) agar tidak tampil sebagai FAILED.
 - Klik judul kolom **Status**, **Model**, **Latency**, atau **Keterangan** untuk mengurutkan; klik lagi untuk membalik arah. Panah ▲/▼ menandai kolom dan arah aktif.
 - Jumlah baris yang sedang tampil ditunjukkan di samping filter (misalnya `2 dari 7 model`).
+- **Copy model siap** menyalin daftar semua model siap dipakai sekaligus, dan tombol **Copy** pada tiap baris menyalin nama model tunggal tersebut.
 
 ## Tes otomatis
 
