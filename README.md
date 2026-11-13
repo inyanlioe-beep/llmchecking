@@ -13,10 +13,19 @@ python app.py
 
 Buka `http://127.0.0.1:8000`. API key dan konfigurasi lainnya otomatis disimpan di browser (`localStorage`) sehingga tidak perlu diisi ulang terus-menerus.
 
+## Endpoint tersimpan
+
+1. Isi **Base URL provider**, **API key**, dan **Nama endpoint** (opsional; default nama host provider).
+2. Klik **Simpan endpoint** untuk menyimpan pasangan Base URL dan API key.
+3. Untuk pengecekan berikutnya, pilih profil di **Endpoint tersimpan**, lalu klik **Cek semua model**. Base URL dan API key akan terisi otomatis; konfigurasi terakhir juga dimuat kembali setelah halaman dibuka ulang.
+4. Untuk menambah profil lain, klik **Endpoint baru**. Untuk mengubah profil terpilih, edit isinya lalu klik **Perbarui endpoint**. **Hapus endpoint** menghapus profil terpilih dan mengosongkan API key pada form.
+
+Profil disimpan di `localStorage` browser, termasuk API key tanpa enkripsi. Gunakan browser dan alamat aplikasi yang sama (termasuk port) untuk mengakses profil tersimpan. API key tidak dimasukkan ke riwayat pengecekan.
+
 ## Menjalankan versi EXE
 
-Jalankan `dist\LLMAvailabilityChecker.exe`, lalu buka `http://127.0.0.1:8000` di browser.
-EXE ini tidak membutuhkan instalasi Python atau package tambahan.
+Jalankan `dist\LLMAvailabilityChecker.exe`, lalu buka `http://127.0.0.1:8000` di browser. Versi ini menyertakan fitur endpoint tersimpan. Tutup aplikasi yang sedang berjalan sebelum mengganti EXE dengan versi baru, lalu jalankan kembali.
+EXE ini tidak membutuhkan instalasi Python atau package tambahan. API hanya menerima request dari localhost; Base URL HTTP hanya diizinkan untuk localhost dan tujuan privat ditolak.
 
 ## Provider lain
 
@@ -33,7 +42,7 @@ Provider harus mendukung:
 - `GET /models`
 - `POST /chat/completions`
 
-Model diuji dengan prompt singkat, `max_tokens: 16`, dan `temperature: 0`. Pengujian memakai concurrency maksimum 10 model agar tidak membebani provider. Hasil awalnya diurutkan dari latency terendah; filter latency maksimum bersifat opsional.
+Tombol **Batalkan** menghentikan permintaan aktif dan membatalkan tes model yang belum berjalan; request jaringan yang sedang berlangsung tetap berhenti setelah timeout. Model diuji dengan prompt singkat, `max_tokens: 16`, dan `temperature: 0`. Pengujian memakai concurrency maksimum 10 model agar tidak membebani provider. Hasil awalnya diurutkan dari latency terendah; filter latency maksimum bersifat opsional. Gunakan **Filter nama model** untuk membatasi model yang diuji, dan **Maksimum model** untuk membatasi jumlah model (default 200, maksimum 500).
 
 ## Filter dan pengurutan
 
@@ -41,6 +50,20 @@ Model diuji dengan prompt singkat, `max_tokens: 16`, dan `temperature: 0`. Pengu
 - **Hanya model chat** menyembunyikan model yang jelas bukan chat (embedding, image, audio, moderation, dan sejenisnya) agar tidak tampil sebagai FAILED.
 - Klik judul kolom **Status**, **Model**, **Latency**, atau **Keterangan** untuk mengurutkan; klik lagi untuk membalik arah. Panah ▲/▼ menandai kolom dan arah aktif.
 - Jumlah baris yang sedang tampil ditunjukkan di samping filter (misalnya `2 dari 7 model`).
+
+## Tes otomatis
+
+Jalankan tes inti dengan:
+
+```powershell
+python -m unittest -v test_app
+```
+
+Tes profil endpoint di antarmuka dapat dijalankan dengan Node.js tanpa package tambahan:
+
+```powershell
+node --test test_profiles.cjs
+```
 
 ## Export hasil
 

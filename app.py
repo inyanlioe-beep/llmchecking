@@ -1,5 +1,7 @@
+import ipaddress
 import json
 import os
+import socket
 import statistics
 import threading
 import time
@@ -11,6 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
+
+MAX_REQUEST_BYTES = 64 * 1024
 
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
@@ -52,15 +56,43 @@ def request_json(
     except urllib.error.HTTPError as error:
         details = error.read().decode("utf-8", errors="replace")
         try:
-            message = json.loads(details).get("error", {}).get("message", details)
+            parsed = json.loads(details)
+            error_data = parsed.get("error", {}) if isinstance(parsed, dict) else {}
+            message = error_data.get("message", details) if isinstance(error_data, dict) else str(error_data)
+            code = error_data.get("code") or error_data.get("type") if isinstance(error_data, dict) else None
         except json.JSONDecodeError:
-            message = details or error.reason
-        raise ProviderError(f"HTTP {error.code}: {message}") from error
+            message, code = details or error.reason, None
+        categories = {
+            401: "Autentikasi ditolak; periksa API key.",
+            403: "Akses ditolak; periksa izin API key atau akses model.",
+            404: "Endpoint atau model tidak ditemukan.",
+            429: "Batas kuota atau rate limit tercapai.",
+            500: "Provider mengalami gangguan internal.",
+            502: "Gateway provider gagal.",
+            503: "Provider sedang tidak tersedia.",
+            504: "Provider melewati batas waktu gateway.",
+        }
+        category = categories.get(error.code, f"HTTP {error.code}")
+        suffix = f" ({code})" if code else ""
+        raise ProviderError(f"{category}{suffix}: {message}") from error
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise ProviderError(str(error)) from error
+        if isinstance(error, (TimeoutError, urllib.error.URLError)) and isinstance(getattr(error, "reason", None), TimeoutError):
+            message = "Waktu tunggu provider habis."
+        elif isinstance(error, TimeoutError):
+            message = "Waktu tunggu provider habis."
+        elif isinstance(error, urllib.error.URLError):
+            message = f"Provider tidak dapat dijangkau: {error.reason}"
+        else:
+            message = "Provider mengembalikan JSON yang tidak valid."
+        raise ProviderError(message) from error
 
 
-def list_models(base_url: str, api_key: str) -> list[str]:
+def list_models(
+    base_url: str,
+    api_key: str,
+    model_filter: str = "",
+    limit: int = 200,
+) -> list[str]:
     response, _ = request_json("GET", f"{base_url}/models", api_key)
     models = response.get("data")
     if not isinstance(models, list):
@@ -74,7 +106,11 @@ def list_models(base_url: str, api_key: str) -> list[str]:
     )
     if not ids:
         raise ProviderError("Provider tidak mengembalikan model.")
-    return ids
+    query = model_filter.strip().casefold()
+    filtered = [model for model in ids if query in model.casefold()]
+    if not filtered:
+        raise ProviderError("Tidak ada model yang cocok dengan filter.")
+    return filtered[:max(1, min(limit, 500))]
 
 
 def test_model(
@@ -115,30 +151,52 @@ def test_model(
         }
 
 
-def run_check(config: dict[str, Any]) -> dict[str, Any]:
+def run_check(config: dict[str, Any], cancel_event: threading.Event | None = None) -> dict[str, Any]:
     base_url = str(config.get("base_url", DEFAULT_BASE_URL)).rstrip("/")
     api_key = str(config.get("api_key", DEFAULT_API_KEY))
     prompt = str(config.get("prompt", DEFAULT_TEST_PROMPT))
     timeout = max(1.0, min(float(config.get("timeout", 30)), 120))
     concurrency = max(1, min(int(config.get("concurrency", 4)), 10))
     max_latency = float(config.get("max_latency", 0) or 0)
+    model_filter = str(config.get("model_filter", "")).strip()
+    model_limit = max(1, min(int(config.get("model_limit", 200)), 500))
 
     if not api_key:
         raise ProviderError("API key wajib diisi.")
-    if not base_url.startswith(("http://", "https://")):
-        raise ProviderError("Base URL harus diawali http:// atau https://.")
+    parsed_url = urlparse(base_url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+        raise ProviderError("Base URL harus berupa URL HTTP(S) valid tanpa kredensial.")
+    if parsed_url.scheme == "http" and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise ProviderError("Untuk host selain localhost, Base URL harus menggunakan HTTPS.")
+    try:
+        addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(parsed_url.hostname, parsed_url.port or (443 if parsed_url.scheme == "https" else 80))}
+    except (OSError, ValueError):
+        raise ProviderError("Host Base URL tidak dapat ditemukan.") from None
+    if any(not address.is_global for address in addresses) and parsed_url.hostname.casefold() not in ("localhost", "127.0.0.1", "::1"):
+        raise ProviderError("Base URL tidak boleh mengarah ke alamat jaringan privat.")
     if not prompt.strip():
         raise ProviderError("Prompt pengujian tidak boleh kosong.")
 
-    models = list_models(base_url, api_key)
+    models = list_models(base_url, api_key, model_filter, model_limit)
     results: list[dict[str, Any]] = []
+    if cancel_event and cancel_event.is_set():
+        raise ProviderError("Pengujian dibatalkan.")
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(test_model, model, base_url, api_key, prompt, timeout): model
             for model in models
         }
-        for future in as_completed(futures):
-            results.append(future.result())
+        try:
+            for future in as_completed(futures):
+                if cancel_event and cancel_event.is_set():
+                    raise ProviderError("Pengujian dibatalkan.")
+                results.append(future.result())
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            if cancel_event and cancel_event.is_set():
+                executor.shutdown(wait=False, cancel_futures=True)
 
     results.sort(
         key=lambda item: (
@@ -159,6 +217,8 @@ def run_check(config: dict[str, Any]) -> dict[str, Any]:
         "available": len(available),
         "ready": len(ready),
         "max_latency": max_latency,
+        "model_filter": model_filter,
+        "model_limit": model_limit,
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "summary": {
             "min_ms": min((item["latency_ms"] for item in available), default=None),
@@ -183,7 +243,8 @@ HTML = r"""<!doctype html>
     main { max-width:1100px; margin:0 auto; padding:32px 18px 56px } h1 { margin:0 0 7px; font-size:28px } p { color:var(--muted); margin:0 0 24px }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:18px }
     .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px } label { display:grid; gap:6px; color:var(--muted); font-size:12px }
-    input, textarea { width:100%; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); padding:10px; font:inherit } textarea { min-height:72px; resize:vertical }
+    input, textarea, select { width:100%; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); padding:10px; font:inherit } textarea { min-height:72px; resize:vertical }
+    .endpoint-profiles { border-bottom:1px solid var(--line); padding-bottom:16px; margin-bottom:16px } .endpoint-profiles .actions { flex-wrap:wrap }
     .wide { grid-column:1/-1 } button { background:var(--blue); color:#07111d; border:0; border-radius:6px; padding:10px 16px; font-weight:700; cursor:pointer } button:disabled { opacity:.55; cursor:wait }
     .actions { display:flex; align-items:center; gap:12px; margin-top:16px } #status { color:var(--muted) } .error { color:var(--red)!important }
     .stats { display:flex; flex-wrap:wrap; gap:18px; color:var(--muted) } .stats strong { color:var(--text); font-size:20px; display:block }
@@ -204,12 +265,28 @@ HTML = r"""<!doctype html>
   <h1>LLM Availability Checker</h1>
   <p>Uji semua model dari satu provider OpenAI-compatible dan urutkan berdasarkan latency terendah.</p>
   <section class="panel">
+    <div class="endpoint-profiles">
+      <div class="grid">
+        <label>Endpoint tersimpan<select id="endpoint_profile"><option value="">Endpoint baru</option></select></label>
+        <label>Nama endpoint (opsional)<input id="profile_name" placeholder="Mis. OpenRouter pribadi" maxlength="100"></label>
+      </div>
+      <div class="actions">
+        <button id="save_endpoint" class="ghost" onclick="saveEndpoint()">Simpan endpoint</button>
+        <button class="ghost" onclick="newEndpoint()">Endpoint baru</button>
+        <button id="delete_endpoint" class="ghost" onclick="deleteEndpoint()" disabled>Hapus endpoint</button>
+      </div>
+      <p class="small" style="margin:12px 0 0">Base URL dan API key disimpan di browser ini. Pilih endpoint tersimpan untuk mengisi keduanya kembali.</p>
+      <div id="profile_status" class="small muted" role="status" aria-live="polite"></div>
+    </div>
     <div class="grid">
       <label>Base URL provider<input id="base_url" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1"></label>
       <label>API key<input id="api_key" type="password" placeholder="sk-..."></label>
       <label class="wide">Prompt pengujian<textarea id="prompt">Reply with exactly: OK</textarea></label>
       <label>Timeout per model (detik)<input id="timeout" type="number" min="1" max="120" value="30"></label>
       <label>Concurrency<input id="concurrency" type="number" min="1" max="10" value="4"></label>
+      <label>Filter nama model<input id="model_filter" placeholder="opsional, mis. gpt"></label>
+      <label>Maksimum model<input id="model_limit" type="number" min="1" max="500" value="200"></label>
+      <label class="inline"><input id="failed_only" type="checkbox"> Hanya model gagal</label>
       <label>Latency maksimum (ms, 0 = semua yang tersedia)<input id="max_latency" type="number" min="0" value="0"></label>
     </div>
     <div class="actions"><button id="run" onclick="runCheck()">Cek semua model</button><span id="status"></span></div>
@@ -217,6 +294,7 @@ HTML = r"""<!doctype html>
   <section id="output" class="panel" hidden>
     <div class="stats">
       <div><strong id="total">-</strong>Total model</div><div><strong id="available">-</strong>Tersedia</div><div><strong id="ready">-</strong>Siap dipakai</div><div><strong id="median">-</strong>Median latency</div>
+      <div><strong id="progress">-</strong>Progres</div>
     </div>
     <div class="copybox"><input id="ready_models" readonly><button onclick="copyModels(event)">Copy model siap</button></div>
     <div class="toolbar">
@@ -237,14 +315,17 @@ HTML = r"""<!doctype html>
 <script>
 const STORAGE_KEY = 'llm_checker_config_v1';
 const HISTORY_KEY = 'llm_checker_history_v1';
+const PROFILES_KEY = 'llm_checker_endpoints_v1';
 const HISTORY_LIMIT = 8;
-const INPUT_IDS = ['base_url', 'api_key', 'prompt', 'timeout', 'concurrency', 'max_latency'];
+const INPUT_IDS = ['base_url', 'api_key', 'prompt', 'timeout', 'concurrency', 'max_latency', 'model_filter', 'model_limit'];
 
 function saveConfig() {
   const config = {};
   INPUT_IDS.forEach(id => {
     config[id] = document.getElementById(id).value;
   });
+  config.profile_id = document.getElementById('endpoint_profile').value;
+  config.profile_name = document.getElementById('profile_name').value;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
   } catch (e) {
@@ -255,16 +336,123 @@ function saveConfig() {
 function loadConfig() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
+    if (!raw) return '';
     const config = JSON.parse(raw);
     INPUT_IDS.forEach(id => {
       if (config[id] !== undefined && config[id] !== null) {
         document.getElementById(id).value = config[id];
       }
     });
+    document.getElementById('profile_name').value = String(config.profile_name || '');
+    return typeof config.profile_id === 'string' ? config.profile_id : '';
   } catch (e) {
     // ignore parsing errors
   }
+  return '';
+}
+
+function loadProfiles() {
+  try {
+    const profiles = JSON.parse(localStorage.getItem(PROFILES_KEY) || '[]');
+    return Array.isArray(profiles) ? profiles.filter(profile =>
+      profile && ['id', 'name', 'base_url', 'api_key'].every(key => typeof profile[key] === 'string')
+    ) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function profileStatus(message, error = false) {
+  const status = document.getElementById('profile_status');
+  status.textContent = message;
+  status.className = error ? 'small error' : 'small muted';
+}
+
+function renderProfiles(selectedId = '') {
+  const select = document.getElementById('endpoint_profile');
+  select.replaceChildren(new Option('Endpoint baru', ''));
+  loadProfiles().forEach(profile => select.add(new Option(profile.name, profile.id)));
+  select.value = selectedId;
+  if (select.selectedIndex < 0) select.value = '';
+  document.getElementById('delete_endpoint').disabled = !select.value;
+  document.getElementById('save_endpoint').textContent = select.value ? 'Perbarui endpoint' : 'Simpan endpoint';
+}
+
+function storeProfiles(profiles) {
+  try {
+    localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+    return true;
+  } catch (e) {
+    profileStatus('Endpoint gagal disimpan. Periksa izin atau ruang penyimpanan browser.', true);
+    return false;
+  }
+}
+
+function saveEndpoint() {
+  const baseUrl = document.getElementById('base_url').value.trim().replace(/\/+$/, '');
+  const apiKey = document.getElementById('api_key').value.trim();
+  let url;
+  try {
+    url = new URL(baseUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) throw new Error();
+  } catch (e) {
+    profileStatus('Isi Base URL HTTP(S) yang valid tanpa kredensial.', true);
+    return;
+  }
+  if (!apiKey) {
+    profileStatus('API key wajib diisi sebelum menyimpan endpoint.', true);
+    return;
+  }
+  const profiles = loadProfiles();
+  const selectedId = document.getElementById('endpoint_profile').value;
+  const existing = profiles.find(profile => profile.id === selectedId);
+  const profile = {
+    id: existing ? existing.id : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    name: document.getElementById('profile_name').value.trim() || url.hostname,
+    base_url: baseUrl,
+    api_key: apiKey,
+  };
+  if (existing) profiles[profiles.indexOf(existing)] = profile;
+  else profiles.push(profile);
+  if (!storeProfiles(profiles)) return;
+  document.getElementById('base_url').value = profile.base_url;
+  document.getElementById('api_key').value = profile.api_key;
+  document.getElementById('profile_name').value = profile.name;
+  renderProfiles(profile.id);
+  saveConfig();
+  profileStatus(`Endpoint "${profile.name}" tersimpan.`);
+}
+
+function selectEndpoint() {
+  const id = document.getElementById('endpoint_profile').value;
+  const profile = loadProfiles().find(item => item.id === id);
+  if (!profile) {
+    newEndpoint();
+    return;
+  }
+  document.getElementById('base_url').value = profile.base_url;
+  document.getElementById('api_key').value = profile.api_key;
+  document.getElementById('profile_name').value = profile.name;
+  renderProfiles(profile.id);
+  saveConfig();
+  profileStatus(`Endpoint "${profile.name}" dipilih.`);
+}
+
+function newEndpoint() {
+  renderProfiles();
+  document.getElementById('profile_name').value = '';
+  document.getElementById('base_url').value = document.getElementById('base_url').defaultValue;
+  document.getElementById('api_key').value = '';
+  saveConfig();
+  profileStatus('Isi Base URL dan API key untuk endpoint baru.');
+}
+
+function deleteEndpoint() {
+  const id = document.getElementById('endpoint_profile').value;
+  if (!id) return;
+  if (!storeProfiles(loadProfiles().filter(profile => profile.id !== id))) return;
+  newEndpoint();
+  profileStatus('Endpoint dihapus.');
 }
 
 let currentData = null;
@@ -280,8 +468,9 @@ function isChatModel(model) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  loadConfig();
-  INPUT_IDS.forEach(id => {
+  renderProfiles(loadConfig());
+  document.getElementById('endpoint_profile').addEventListener('change', selectEndpoint);
+  [...INPUT_IDS, 'profile_name'].forEach(id => {
     document.getElementById(id).addEventListener('input', saveConfig);
     document.getElementById(id).addEventListener('change', saveConfig);
   });
@@ -294,6 +483,7 @@ document.addEventListener('DOMContentLoaded', () => {
     chatOnly = event.target.checked;
     renderRows();
   });
+  document.getElementById('failed_only').addEventListener('change', renderRows);
   document.querySelectorAll('th.sortable').forEach(header => {
     header.addEventListener('click', () => {
       const key = header.dataset.sort;
@@ -344,7 +534,8 @@ function visibleModels(data) {
   const query = currentQuery.trim().toLowerCase();
   const filtered = data.models.filter(item =>
     (!query || item.model.toLowerCase().includes(query)) &&
-    (!chatOnly || isChatModel(item.model))
+    (!chatOnly || isChatModel(item.model)) &&
+    (!document.getElementById('failed_only').checked || !item.available)
   );
   const direction = sortDir === 'asc' ? 1 : -1;
   return filtered
@@ -508,16 +699,28 @@ function clearHistory() {
 
 async function runCheck() {
   const button = document.getElementById('run'), status = document.getElementById('status');
-  button.disabled = true; status.className = ''; status.textContent = 'Mengambil model dan melakukan pengujian...';
+  const requestId = `${Date.now()}-${Math.random()}`;
+  const controller = new AbortController();
+  button.disabled = false; button.textContent = 'Batalkan'; button.onclick = () => {
+    fetch('/api/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:requestId})}).catch(() => {});
+    controller.abort();
+  };
+  status.className = ''; status.textContent = 'Mengambil model dan melakukan pengujian...';
   document.getElementById('output').hidden = true;
-  const payload = Object.fromEntries(['base_url','api_key','prompt','timeout','concurrency','max_latency'].map(id => [id, document.getElementById(id).value]));
+  document.getElementById('progress').textContent = '0%';
+  const payload = Object.fromEntries(['base_url','api_key','prompt','timeout','concurrency','max_latency','model_filter','model_limit'].map(id => [id, document.getElementById(id).value]));
+  payload.request_id = requestId;
   try {
-    const response = await fetch('/api/check', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const response = await fetch('/api/check', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload), signal:controller.signal});
     const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Gagal menjalankan pengecekan.');
     render(data); status.textContent = `Selesai pada ${data.checked_at}`;
     saveToHistory(data);
-  } catch (error) { status.className = 'error'; status.textContent = error.message; }
-  finally { button.disabled = false; }
+  } catch (error) {
+    status.className = error.name === 'AbortError' ? '' : 'error';
+    status.textContent = error.name === 'AbortError' ? 'Permintaan dibatalkan; pekerjaan di server mungkin masih berjalan.' : error.message;
+  } finally {
+    button.textContent = 'Cek semua model'; button.onclick = runCheck;
+  }
 }
 function render(data) {
   currentData = data;
@@ -553,6 +756,9 @@ function escapeHtml(value) { return String(value).replace(/[&<>"']/g, c => ({'&'
 </html>"""
 
 
+CANCELLATIONS: dict[str, threading.Event] = {}
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -574,14 +780,35 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/check":
+        path = urlparse(self.path)
+        if path.path not in ("/api/check", "/api/cancel"):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "API hanya tersedia dari localhost."})
+                return
             length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > MAX_REQUEST_BYTES:
+                self.send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Ukuran request tidak valid atau terlalu besar."})
+                return
             config = json.loads(self.rfile.read(length))
-            result = run_check(config)
-            self.send_json(HTTPStatus.OK, result)
+            if not isinstance(config, dict):
+                raise ValueError("Request harus berupa objek JSON.")
+            if path.path == "/api/cancel":
+                event = CANCELLATIONS.get(str(config.get("id", "")))
+                if event:
+                    event.set()
+                self.send_json(HTTPStatus.OK, {"cancelled": event is not None})
+                return
+            request_id = str(config.get("request_id", ""))
+            cancel_event = threading.Event()
+            CANCELLATIONS[request_id] = cancel_event
+            try:
+                result = run_check(config, cancel_event)
+                self.send_json(HTTPStatus.OK, result)
+            finally:
+                CANCELLATIONS.pop(request_id, None)
         except (ProviderError, ValueError, TypeError, json.JSONDecodeError) as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
