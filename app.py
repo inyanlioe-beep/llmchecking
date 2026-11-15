@@ -247,6 +247,10 @@ HTML = r"""<!doctype html>
     .endpoint-profiles { border-bottom:1px solid var(--line); padding-bottom:16px; margin-bottom:16px } .endpoint-profiles .actions { flex-wrap:wrap }
     .wide { grid-column:1/-1 } button { background:var(--blue); color:#07111d; border:0; border-radius:6px; padding:10px 16px; font-weight:700; cursor:pointer } button:disabled { opacity:.55; cursor:wait }
     .actions { display:flex; align-items:center; gap:12px; margin-top:16px } #status { color:var(--muted) } .error { color:var(--red)!important }
+    .progress-wrap { height:4px; background:var(--line); border-radius:2px; margin-top:12px; overflow:hidden; display:none }
+    .progress-wrap.active { display:block }
+    .progress-bar { height:100%; width:40%; background:var(--blue); border-radius:2px; animation:progress-slide 1.4s ease-in-out infinite }
+    @keyframes progress-slide { 0%{transform:translateX(-100%)} 100%{transform:translateX(350%)} }
     .stats { display:flex; flex-wrap:wrap; gap:18px; color:var(--muted) } .stats strong { color:var(--text); font-size:20px; display:block }
     .copybox { display:flex; gap:8px; margin-top:12px } .copybox input { font-family:ui-monospace,monospace } .copybox button { background:var(--line); color:var(--text) }
     table { border-collapse:collapse; table-layout:fixed; width:100%; margin-top:14px } th,td { text-align:left; border-bottom:1px solid var(--line); padding:11px 8px; vertical-align:top; overflow-wrap:anywhere } th { color:var(--muted); font-size:12px } th:nth-child(1),td:nth-child(1) { width:10% } th:nth-child(2),td:nth-child(2) { width:22%; min-width:180px } th:nth-child(3),td:nth-child(3) { width:12% } th:nth-child(5),td:nth-child(5) { width:8% } .row-copy { background:var(--line); color:var(--text); padding:6px 9px; font-size:12px; white-space:nowrap }
@@ -291,6 +295,7 @@ HTML = r"""<!doctype html>
       <label>Latency maksimum (ms, 0 = semua yang tersedia)<input id="max_latency" type="number" min="0" value="0"></label>
     </div>
     <div class="actions"><button id="run" onclick="runCheck()">Cek semua model</button><span id="status"></span></div>
+    <div class="progress-wrap" id="progress_wrap"><div class="progress-bar"></div></div>
   </section>
   <section id="output" class="panel" hidden>
     <div class="stats">
@@ -700,6 +705,7 @@ function clearHistory() {
 
 async function runCheck() {
   const button = document.getElementById('run'), status = document.getElementById('status');
+  const progressWrap = document.getElementById('progress_wrap');
   const requestId = `${Date.now()}-${Math.random()}`;
   const controller = new AbortController();
   button.disabled = false; button.textContent = 'Batalkan'; button.onclick = () => {
@@ -709,6 +715,7 @@ async function runCheck() {
   status.className = ''; status.textContent = 'Mengambil model dan melakukan pengujian...';
   document.getElementById('output').hidden = true;
   document.getElementById('progress').textContent = '0%';
+  progressWrap.classList.add('active');
   const payload = Object.fromEntries(['base_url','api_key','prompt','timeout','concurrency','max_latency','model_filter','model_limit'].map(id => [id, document.getElementById(id).value]));
   payload.request_id = requestId;
   try {
@@ -720,6 +727,7 @@ async function runCheck() {
     status.className = error.name === 'AbortError' ? '' : 'error';
     status.textContent = error.name === 'AbortError' ? 'Permintaan dibatalkan; pekerjaan di server mungkin masih berjalan.' : error.message;
   } finally {
+    progressWrap.classList.remove('active');
     button.textContent = 'Cek semua model'; button.onclick = runCheck;
   }
 }
