@@ -10,7 +10,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 
@@ -151,7 +151,7 @@ def test_model(
         }
 
 
-def run_check(config: dict[str, Any], cancel_event: threading.Event | None = None) -> dict[str, Any]:
+def validate_check_config(config: dict[str, Any]) -> dict[str, Any]:
     base_url = str(config.get("base_url", DEFAULT_BASE_URL)).rstrip("/")
     api_key = str(config.get("api_key", DEFAULT_API_KEY))
     prompt = str(config.get("prompt", DEFAULT_TEST_PROMPT))
@@ -177,20 +177,55 @@ def run_check(config: dict[str, Any], cancel_event: threading.Event | None = Non
     if not prompt.strip():
         raise ProviderError("Prompt pengujian tidak boleh kosong.")
 
-    models = list_models(base_url, api_key, model_filter, model_limit)
-    results: list[dict[str, Any]] = []
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "prompt": prompt,
+        "timeout": timeout,
+        "concurrency": concurrency,
+        "max_latency": max_latency,
+        "model_filter": model_filter,
+        "model_limit": model_limit,
+    }
+
+
+def stream_check(
+    config: dict[str, Any],
+    cancel_event: threading.Event | None = None,
+) -> Iterator[dict[str, Any]]:
+    cfg = validate_check_config(config)
+    models = list_models(cfg["base_url"], cfg["api_key"], cfg["model_filter"], cfg["model_limit"])
+    total_models = len(models)
+    yield {
+        "type": "init",
+        "total": total_models,
+        "models": models,
+        "max_latency": cfg["max_latency"],
+    }
+
     if cancel_event and cancel_event.is_set():
         raise ProviderError("Pengujian dibatalkan.")
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+
+    results: list[dict[str, Any]] = []
+    tested_count = 0
+    with ThreadPoolExecutor(max_workers=cfg["concurrency"]) as executor:
         futures = {
-            executor.submit(test_model, model, base_url, api_key, prompt, timeout): model
+            executor.submit(test_model, model, cfg["base_url"], cfg["api_key"], cfg["prompt"], cfg["timeout"]): model
             for model in models
         }
         try:
             for future in as_completed(futures):
                 if cancel_event and cancel_event.is_set():
                     raise ProviderError("Pengujian dibatalkan.")
-                results.append(future.result())
+                model_result = future.result()
+                results.append(model_result)
+                tested_count += 1
+                yield {
+                    "type": "model",
+                    "result": model_result,
+                    "tested": tested_count,
+                    "total": total_models,
+                }
         finally:
             for future in futures:
                 if not future.done():
@@ -209,16 +244,16 @@ def run_check(config: dict[str, Any], cancel_event: threading.Event | None = Non
     ready = [
         item
         for item in available
-        if max_latency <= 0 or item["latency_ms"] <= max_latency
+        if cfg["max_latency"] <= 0 or item["latency_ms"] <= cfg["max_latency"]
     ]
-    return {
+    final_data = {
         "models": results,
         "total": len(results),
         "available": len(available),
         "ready": len(ready),
-        "max_latency": max_latency,
-        "model_filter": model_filter,
-        "model_limit": model_limit,
+        "max_latency": cfg["max_latency"],
+        "model_filter": cfg["model_filter"],
+        "model_limit": cfg["model_limit"],
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "summary": {
             "min_ms": min((item["latency_ms"] for item in available), default=None),
@@ -229,6 +264,20 @@ def run_check(config: dict[str, Any], cancel_event: threading.Event | None = Non
             ),
         },
     }
+    yield {
+        "type": "done",
+        "data": final_data,
+    }
+
+
+def run_check(config: dict[str, Any], cancel_event: threading.Event | None = None) -> dict[str, Any]:
+    final_data = None
+    for event in stream_check(config, cancel_event):
+        if event["type"] == "done":
+            final_data = event["data"]
+    if final_data is None:
+        raise ProviderError("Pengujian tidak menghasilkan data.")
+    return final_data
 
 
 HTML = r"""<!doctype html>
@@ -249,7 +298,8 @@ HTML = r"""<!doctype html>
     .actions { display:flex; align-items:center; gap:12px; margin-top:16px } #status { color:var(--muted) } .error { color:var(--red)!important }
     .progress-wrap { height:4px; background:var(--line); border-radius:2px; margin-top:12px; overflow:hidden; display:none }
     .progress-wrap.active { display:block }
-    .progress-bar { height:100%; width:40%; background:var(--blue); border-radius:2px; animation:progress-slide 1.4s ease-in-out infinite }
+    .progress-bar { height:100%; width:0%; background:var(--blue); border-radius:2px; transition:width .15s ease }
+    .progress-wrap.indeterminate .progress-bar { width:40%; animation:progress-slide 1.4s ease-in-out infinite }
     @keyframes progress-slide { 0%{transform:translateX(-100%)} 100%{transform:translateX(350%)} }
     .stats { display:flex; flex-wrap:wrap; gap:18px; color:var(--muted) } .stats strong { color:var(--text); font-size:20px; display:block }
     .copybox { display:flex; gap:8px; margin-top:12px } .copybox input { font-family:ui-monospace,monospace } .copybox button { background:var(--line); color:var(--text) }
@@ -295,7 +345,7 @@ HTML = r"""<!doctype html>
       <label>Latency maksimum (ms, 0 = semua yang tersedia)<input id="max_latency" type="number" min="0" value="0"></label>
     </div>
     <div class="actions"><button id="run" onclick="runCheck()">Cek semua model</button><span id="status"></span></div>
-    <div class="progress-wrap" id="progress_wrap"><div class="progress-bar"></div></div>
+    <div class="progress-wrap" id="progress_wrap"><div class="progress-bar" id="progress_bar"></div></div>
   </section>
   <section id="output" class="panel" hidden>
     <div class="stats">
@@ -550,12 +600,21 @@ function visibleModels(data) {
     .map(entry => entry.item);
 }
 
+function calculateMedian(numbers) {
+  if (!numbers.length) return null;
+  const sorted = [...numbers].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const val = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  return Math.round(val * 10) / 10;
+}
+
 function showSummary(data) {
   document.getElementById('output').hidden = false;
   document.getElementById('total').textContent = data.total;
   document.getElementById('available').textContent = data.available;
   document.getElementById('ready').textContent = data.ready;
-  document.getElementById('median').textContent = data.summary.median_ms == null ? '-' : `${data.summary.median_ms} ms`;
+  document.getElementById('median').textContent = data.summary && data.summary.median_ms != null ? `${data.summary.median_ms} ms` : '-';
+  if (data.checked_at) document.getElementById('progress').textContent = '100%';
   const ready = data.models.filter(x => x.available && (!data.max_latency || x.latency_ms <= data.max_latency)).map(x => x.model);
   document.getElementById('ready_models').value = ready.join(', ');
 }
@@ -706,29 +765,135 @@ function clearHistory() {
 async function runCheck() {
   const button = document.getElementById('run'), status = document.getElementById('status');
   const progressWrap = document.getElementById('progress_wrap');
-  const requestId = `${Date.now()}-${Math.random()}`;
+  const progressBar = document.getElementById('progress_bar');
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const controller = new AbortController();
-  button.disabled = false; button.textContent = 'Batalkan'; button.onclick = () => {
+  button.disabled = false;
+  button.textContent = 'Batalkan';
+  button.onclick = () => {
     fetch('/api/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:requestId})}).catch(() => {});
     controller.abort();
   };
-  status.className = ''; status.textContent = 'Mengambil model dan melakukan pengujian...';
+  status.className = '';
+  status.textContent = 'Mengambil daftar model dari provider...';
   document.getElementById('output').hidden = true;
   document.getElementById('progress').textContent = '0%';
-  progressWrap.classList.add('active');
+  if (progressBar) progressBar.style.width = '0%';
+  progressWrap.classList.add('active', 'indeterminate');
+
   const payload = Object.fromEntries(['base_url','api_key','prompt','timeout','concurrency','max_latency','model_filter','model_limit'].map(id => [id, document.getElementById(id).value]));
   payload.request_id = requestId;
+  payload.stream = true;
+
   try {
-    const response = await fetch('/api/check', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload), signal:controller.signal});
-    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Gagal menjalankan pengecekan.');
-    render(data); status.textContent = `Selesai pada ${data.checked_at}`;
-    saveToHistory(data);
+    const response = await fetch('/api/check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error || 'Gagal menjalankan pengecekan.');
+    }
+
+    if (!response.body || typeof response.body.getReader !== 'function') {
+      const data = await response.json();
+      render(data);
+      status.textContent = `Selesai pada ${data.checked_at}`;
+      saveToHistory(data);
+      return;
+    }
+
+    const maxLatency = Number(payload.max_latency || 0);
+    currentData = {
+      models: [],
+      total: 0,
+      available: 0,
+      ready: 0,
+      max_latency: maxLatency,
+      summary: { min_ms: null, median_ms: null },
+    };
+
+    const reader = response.body.getReader();
+    const decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8') : null;
+    let buffer = '';
+
+    const handleMessage = (msg) => {
+      if (!msg) return;
+      if (msg.type === 'error') {
+        throw new Error(msg.error || 'Terjadi kesalahan pada provider.');
+      }
+      if (msg.type === 'init') {
+        currentData.total = msg.total;
+        document.getElementById('output').hidden = false;
+        progressWrap.classList.remove('indeterminate');
+        status.textContent = `Menguji model (0/${msg.total})...`;
+        document.getElementById('progress').textContent = `0% (0/${msg.total})`;
+        if (progressBar) progressBar.style.width = '0%';
+        showSummary(currentData);
+        renderRows();
+      } else if (msg.type === 'model') {
+        currentData.models.push(msg.result);
+        const tested = msg.tested;
+        const total = msg.total || currentData.total;
+        const avail = currentData.models.filter(m => m.available);
+        currentData.available = avail.length;
+        currentData.ready = avail.filter(m => !currentData.max_latency || m.latency_ms <= currentData.max_latency).length;
+        const latencies = avail.map(m => m.latency_ms);
+        currentData.summary = {
+          min_ms: latencies.length ? Math.min(...latencies) : null,
+          median_ms: calculateMedian(latencies),
+        };
+        const pct = total ? Math.round((tested / total) * 100) : 0;
+        status.textContent = `Menguji model (${tested}/${total})...`;
+        document.getElementById('progress').textContent = `${pct}% (${tested}/${total})`;
+        if (progressBar) progressBar.style.width = `${pct}%`;
+        showSummary(currentData);
+        renderRows();
+      } else if (msg.type === 'done') {
+        currentData = msg.data;
+        if (progressBar) progressBar.style.width = '100%';
+        document.getElementById('progress').textContent = `100% (${currentData.total}/${currentData.total})`;
+        render(currentData);
+        status.textContent = `Selesai pada ${currentData.checked_at}`;
+        saveToHistory(currentData);
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder ? decoder.decode(value, { stream: true }) : String.fromCharCode.apply(null, value);
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) handleMessage(JSON.parse(trimmed));
+      }
+    }
+    if (buffer.trim()) {
+      handleMessage(JSON.parse(buffer.trim()));
+    }
   } catch (error) {
-    status.className = error.name === 'AbortError' ? '' : 'error';
-    status.textContent = error.name === 'AbortError' ? 'Permintaan dibatalkan; pekerjaan di server mungkin masih berjalan.' : error.message;
+    if (error.name === 'AbortError') {
+      status.className = '';
+      status.textContent = currentData && currentData.models.length
+        ? `Pengujian dibatalkan (${currentData.models.length} model telah diuji).`
+        : 'Permintaan dibatalkan; pekerjaan di server mungkin masih berjalan.';
+      if (currentData && currentData.models.length) {
+        renderRows();
+        showSummary(currentData);
+      }
+    } else {
+      status.className = 'error';
+      status.textContent = error.message;
+    }
   } finally {
-    progressWrap.classList.remove('active');
-    button.textContent = 'Cek semua model'; button.onclick = runCheck;
+    progressWrap.classList.remove('active', 'indeterminate');
+    if (progressBar) progressBar.style.width = '0%';
+    button.textContent = 'Cek semua model';
+    button.onclick = runCheck;
   }
 }
 function render(data) {
@@ -814,8 +979,30 @@ class Handler(BaseHTTPRequestHandler):
             cancel_event = threading.Event()
             CANCELLATIONS[request_id] = cancel_event
             try:
-                result = run_check(config, cancel_event)
-                self.send_json(HTTPStatus.OK, result)
+                if bool(config.get("stream", False)):
+                    validate_check_config(config)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    try:
+                        for event in stream_check(config, cancel_event):
+                            line = (json.dumps(event) + "\n").encode("utf-8")
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        cancel_event.set()
+                    except ProviderError as error:
+                        line = (json.dumps({"type": "error", "error": str(error)}) + "\n").encode("utf-8")
+                        try:
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                else:
+                    result = run_check(config, cancel_event)
+                    self.send_json(HTTPStatus.OK, result)
             finally:
                 CANCELLATIONS.pop(request_id, None)
         except (ProviderError, ValueError, TypeError, json.JSONDecodeError) as error:

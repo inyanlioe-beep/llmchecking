@@ -42,7 +42,7 @@ Provider harus mendukung:
 - `GET /models`
 - `POST /chat/completions`
 
-Tombol **Batalkan** menghentikan permintaan aktif dan membatalkan tes model yang belum berjalan; request jaringan yang sedang berlangsung tetap berhenti setelah timeout. Model diuji dengan prompt singkat, `max_tokens: 16`, dan `temperature: 0`. Pengujian memakai concurrency maksimum 10 model agar tidak membebani provider. Hasil awalnya diurutkan dari latency terendah; filter latency maksimum bersifat opsional. Gunakan **Filter nama model** untuk membatasi model yang diuji, dan **Maksimum model** untuk membatasi jumlah model (default 200, maksimum 500). Opsi **Hanya model gagal** menyembunyikan model yang sudah READY dari tabel hasil, sehingga hanya model yang gagal yang tampak.
+Hasil pengujian dikirim secara real-time via streaming (NDJSON), sehingga baris model, status, latensi, dan persentase progres langsung tampil di tabel satu per satu begitu selesai diuji tanpa perlu menunggu seluruh antrean selesai. Tombol **Batalkan** menghentikan permintaan aktif dan membatalkan tes model yang belum berjalan; hasil model yang sudah selesai diuji tetap dipertahankan di antarmuka. Model diuji dengan prompt singkat, `max_tokens: 16`, dan `temperature: 0`. Pengujian memakai concurrency maksimum 10 model agar tidak membebani provider. Hasil awalnya diurutkan dari latency terendah; filter latency maksimum bersifat opsional. Gunakan **Filter nama model** untuk membatasi model yang diuji, dan **Maksimum model** untuk membatasi jumlah model (default 200, maksimum 500). Opsi **Hanya model gagal** menyembunyikan model yang sudah READY dari tabel hasil, sehingga hanya model yang gagal yang tampak.
 
 ## Filter dan pengurutan
 
