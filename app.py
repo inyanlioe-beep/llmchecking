@@ -177,6 +177,15 @@ def validate_check_config(config: dict[str, Any]) -> dict[str, Any]:
     if not prompt.strip():
         raise ProviderError("Prompt pengujian tidak boleh kosong.")
 
+    models_raw = config.get("models")
+    target_models = None
+    if models_raw is not None:
+        if not isinstance(models_raw, list) or not all(isinstance(m, str) for m in models_raw):
+            raise ProviderError("Daftar model harus berupa array string.")
+        target_models = list(dict.fromkeys(m.strip() for m in models_raw if m.strip()))
+        if not target_models:
+            raise ProviderError("Daftar model yang diuji tidak boleh kosong.")
+
     return {
         "base_url": base_url,
         "api_key": api_key,
@@ -186,6 +195,7 @@ def validate_check_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_latency": max_latency,
         "model_filter": model_filter,
         "model_limit": model_limit,
+        "models": target_models,
     }
 
 
@@ -194,7 +204,10 @@ def stream_check(
     cancel_event: threading.Event | None = None,
 ) -> Iterator[dict[str, Any]]:
     cfg = validate_check_config(config)
-    models = list_models(cfg["base_url"], cfg["api_key"], cfg["model_filter"], cfg["model_limit"])
+    if cfg["models"] is not None:
+        models = cfg["models"][:cfg["model_limit"]]
+    else:
+        models = list_models(cfg["base_url"], cfg["api_key"], cfg["model_filter"], cfg["model_limit"])
     total_models = len(models)
     yield {
         "type": "init",
@@ -303,7 +316,7 @@ HTML = r"""<!doctype html>
     @keyframes progress-slide { 0%{transform:translateX(-100%)} 100%{transform:translateX(350%)} }
     .stats { display:flex; flex-wrap:wrap; gap:18px; color:var(--muted) } .stats strong { color:var(--text); font-size:20px; display:block }
     .copybox { display:flex; gap:8px; margin-top:12px } .copybox input { font-family:ui-monospace,monospace } .copybox button { background:var(--line); color:var(--text) }
-    table { border-collapse:collapse; table-layout:fixed; width:100%; margin-top:14px } th,td { text-align:left; border-bottom:1px solid var(--line); padding:11px 8px; vertical-align:top; overflow-wrap:anywhere } th { color:var(--muted); font-size:12px } th:nth-child(1),td:nth-child(1) { width:10% } th:nth-child(2),td:nth-child(2) { width:22%; min-width:180px } th:nth-child(3),td:nth-child(3) { width:12% } th:nth-child(5),td:nth-child(5) { width:8% } .row-copy { background:var(--line); color:var(--text); padding:6px 9px; font-size:12px; white-space:nowrap }
+    table { border-collapse:collapse; table-layout:fixed; width:100%; margin-top:14px } th,td { text-align:left; border-bottom:1px solid var(--line); padding:11px 8px; vertical-align:top; overflow-wrap:anywhere } th { color:var(--muted); font-size:12px } th:nth-child(1),td:nth-child(1) { width:10% } th:nth-child(2),td:nth-child(2) { width:22%; min-width:180px } th:nth-child(3),td:nth-child(3) { width:12% } th:nth-child(5),td:nth-child(5) { width:16%; min-width:145px } .row-copy { background:var(--line); color:var(--text); padding:6px 9px; font-size:12px; white-space:nowrap } .row-actions { display:inline-flex; gap:6px; flex-wrap:nowrap }
     .ok { color:var(--green) } .fail { color:var(--red) } code { font-family:ui-monospace,monospace; word-break:normal; overflow-wrap:anywhere }
     .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:14px } .toolbar input[type=search] { flex:1 1 220px; padding:8px 10px } .toolbar .spacer { flex:1 }
     .inline { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px } .inline input { width:auto } .grid .inline { padding-top:18px }
@@ -358,6 +371,8 @@ HTML = r"""<!doctype html>
       <label class="inline"><input id="chat_only" type="checkbox"> Hanya model chat</label>
       <span id="filter_count" class="muted small"></span>
       <span class="spacer"></span>
+      <button class="ghost" id="retest_failed" onclick="retestFailed()" style="display:none">Uji ulang gagal</button>
+      <button class="ghost" id="export_md" onclick="exportMarkdown()">Export Markdown</button>
       <button class="ghost" id="export_json" onclick="exportJson()">Export JSON</button>
       <button class="ghost" id="export_csv" onclick="exportCsv()">Export CSV</button>
     </div>
@@ -608,6 +623,46 @@ function calculateMedian(numbers) {
   return Math.round(val * 10) / 10;
 }
 
+function updateRetestFailedButton() {
+  const btn = document.getElementById('retest_failed');
+  if (!btn) return;
+  if (!currentData || !Array.isArray(currentData.models)) {
+    btn.style.display = 'none';
+    return;
+  }
+  const failedCount = currentData.models.filter(m => !m.available).length;
+  if (failedCount > 0) {
+    btn.style.display = '';
+    btn.textContent = `Uji ulang gagal (${failedCount})`;
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
+function recomputeDataStats(data) {
+  if (!data || !Array.isArray(data.models)) return;
+  const avail = data.models.filter(m => m.available);
+  data.total = data.models.length;
+  data.available = avail.length;
+  data.ready = avail.filter(m => !data.max_latency || m.latency_ms <= data.max_latency).length;
+  const latencies = avail.map(m => m.latency_ms).filter(n => n != null);
+  data.summary = {
+    min_ms: latencies.length ? Math.min(...latencies) : null,
+    median_ms: calculateMedian(latencies),
+  };
+}
+
+function updateModelResult(result) {
+  if (!currentData || !Array.isArray(currentData.models)) return;
+  const idx = currentData.models.findIndex(m => m.model === result.model);
+  if (idx >= 0) {
+    currentData.models[idx] = result;
+  } else {
+    currentData.models.push(result);
+  }
+  recomputeDataStats(currentData);
+}
+
 function showSummary(data) {
   document.getElementById('output').hidden = false;
   document.getElementById('total').textContent = data.total;
@@ -617,6 +672,7 @@ function showSummary(data) {
   if (data.checked_at) document.getElementById('progress').textContent = '100%';
   const ready = data.models.filter(x => x.available && (!data.max_latency || x.latency_ms <= data.max_latency)).map(x => x.model);
   document.getElementById('ready_models').value = ready.join(', ');
+  updateRetestFailedButton();
 }
 
 function renderRows() {
@@ -634,7 +690,36 @@ function renderRows() {
     rows.innerHTML = '<tr><td colspan="5" class="muted">Tidak ada model yang cocok dengan filter.</td></tr>';
     return;
   }
-  rows.innerHTML = items.map(x => `<tr><td class="${x.available?'ok':'fail'}">${x.available?'READY':'FAILED'}</td><td class="model-cell"><code>${escapeHtml(x.model)}</code></td><td>${x.latency_ms == null ? '-' : x.latency_ms+' ms'}</td><td>${escapeHtml(noteText(x))}</td><td><button class="row-copy" data-model="${escapeHtml(x.model)}" onclick="copyModel(this)">Copy</button></td></tr>`).join('');
+  rows.innerHTML = items.map(x => `<tr><td class="${x.available?'ok':'fail'}">${x.available?'READY':'FAILED'}</td><td class="model-cell"><code>${escapeHtml(x.model)}</code></td><td>${x.latency_ms == null ? '-' : x.latency_ms+' ms'}</td><td>${escapeHtml(noteText(x))}</td><td><div class="row-actions"><button class="row-copy" data-model="${escapeHtml(x.model)}" onclick="copyModel(this)">Copy</button><button class="row-copy" data-model="${escapeHtml(x.model)}" onclick="retestSingleModel(this, '${escapeHtml(x.model)}')">Uji ulang</button></div></td></tr>`).join('');
+}
+
+function exportMarkdown() {
+  if (!currentData) return;
+  const models = visibleModels(currentData);
+  const baseUrl = document.getElementById('base_url').value;
+  const timeStr = currentData.checked_at || new Date().toISOString();
+  const lines = [
+    '# Hasil Pengecekan LLM',
+    '',
+    `- Waktu: ${timeStr}`,
+    `- Provider: \`${baseUrl}\``,
+    `- Total model: ${models.length}${models.length !== currentData.models.length ? ` (difilter dari ${currentData.models.length})` : ''}`,
+    `- Tersedia: ${models.filter(m => m.available).length}`,
+    `- Siap dipakai: ${models.filter(m => m.available && (!currentData.max_latency || m.latency_ms <= currentData.max_latency)).length}`,
+    `- Median latency: ${currentData.summary && currentData.summary.median_ms != null ? currentData.summary.median_ms + ' ms' : '-'}`,
+    '',
+    '| Status | Model | Latency | Keterangan |',
+    '| :--- | :--- | :---: | :--- |',
+  ];
+  models.forEach(item => {
+    const status = item.available ? 'READY' : 'FAILED';
+    const model = item.model.replace(/\|/g, '\\|');
+    const latency = item.latency_ms == null ? '-' : `${item.latency_ms} ms`;
+    const note = noteText(item).replace(/\|/g, '\\|');
+    lines.push(`| ${status} | \`${model}\` | ${latency} | ${note} |`);
+  });
+  lines.push('');
+  downloadFile(`llm-check-${fileStamp(currentData)}.md`, lines.join('\n'), 'text/markdown');
 }
 
 function exportJson() {
@@ -762,7 +847,28 @@ function clearHistory() {
   renderHistory();
 }
 
-async function runCheck() {
+let isChecking = false;
+
+function timeStampNow() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function retestFailed() {
+  if (isChecking || !currentData || !Array.isArray(currentData.models)) return;
+  const failed = currentData.models.filter(m => !m.available).map(m => m.model);
+  if (!failed.length) return;
+  runCheck(failed);
+}
+
+function retestSingleModel(button, modelName) {
+  if (isChecking) return;
+  runCheck([modelName]);
+}
+
+async function runCheck(targetModels = null) {
+  if (isChecking) return;
+  isChecking = true;
+  const isRetest = Array.isArray(targetModels) && targetModels.length > 0;
   const button = document.getElementById('run'), status = document.getElementById('status');
   const progressWrap = document.getElementById('progress_wrap');
   const progressBar = document.getElementById('progress_bar');
@@ -775,15 +881,22 @@ async function runCheck() {
     controller.abort();
   };
   status.className = '';
-  status.textContent = 'Mengambil daftar model dari provider...';
-  document.getElementById('output').hidden = true;
-  document.getElementById('progress').textContent = '0%';
+  status.textContent = isRetest
+    ? `Menguji ulang ${targetModels.length} model...`
+    : 'Mengambil daftar model dari provider...';
+  if (!isRetest) {
+    document.getElementById('output').hidden = true;
+    document.getElementById('progress').textContent = '0%';
+  }
   if (progressBar) progressBar.style.width = '0%';
   progressWrap.classList.add('active', 'indeterminate');
 
   const payload = Object.fromEntries(['base_url','api_key','prompt','timeout','concurrency','max_latency','model_filter','model_limit'].map(id => [id, document.getElementById(id).value]));
   payload.request_id = requestId;
   payload.stream = true;
+  if (isRetest) {
+    payload.models = targetModels;
+  }
 
   try {
     const response = await fetch('/api/check', {
@@ -799,21 +912,31 @@ async function runCheck() {
 
     if (!response.body || typeof response.body.getReader !== 'function') {
       const data = await response.json();
-      render(data);
-      status.textContent = `Selesai pada ${data.checked_at}`;
-      saveToHistory(data);
+      if (isRetest && currentData) {
+        data.models.forEach(m => updateModelResult(m));
+        currentData.checked_at = timeStampNow();
+        render(currentData);
+        status.textContent = `Selesai pada ${currentData.checked_at}`;
+        saveToHistory(currentData);
+      } else {
+        render(data);
+        status.textContent = `Selesai pada ${data.checked_at}`;
+        saveToHistory(data);
+      }
       return;
     }
 
     const maxLatency = Number(payload.max_latency || 0);
-    currentData = {
-      models: [],
-      total: 0,
-      available: 0,
-      ready: 0,
-      max_latency: maxLatency,
-      summary: { min_ms: null, median_ms: null },
-    };
+    if (!isRetest || !currentData) {
+      currentData = {
+        models: [],
+        total: 0,
+        available: 0,
+        ready: 0,
+        max_latency: maxLatency,
+        summary: { min_ms: null, median_ms: null },
+      };
+    }
 
     const reader = response.body.getReader();
     const decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8') : null;
@@ -825,39 +948,59 @@ async function runCheck() {
         throw new Error(msg.error || 'Terjadi kesalahan pada provider.');
       }
       if (msg.type === 'init') {
-        currentData.total = msg.total;
+        if (!isRetest) {
+          currentData.total = msg.total;
+        }
         document.getElementById('output').hidden = false;
         progressWrap.classList.remove('indeterminate');
-        status.textContent = `Menguji model (0/${msg.total})...`;
+        status.textContent = isRetest
+          ? `Menguji ulang model (0/${msg.total})...`
+          : `Menguji model (0/${msg.total})...`;
         document.getElementById('progress').textContent = `0% (0/${msg.total})`;
         if (progressBar) progressBar.style.width = '0%';
         showSummary(currentData);
         renderRows();
       } else if (msg.type === 'model') {
-        currentData.models.push(msg.result);
+        if (isRetest) {
+          updateModelResult(msg.result);
+        } else {
+          currentData.models.push(msg.result);
+          const avail = currentData.models.filter(m => m.available);
+          currentData.available = avail.length;
+          currentData.ready = avail.filter(m => !currentData.max_latency || m.latency_ms <= currentData.max_latency).length;
+          const latencies = avail.map(m => m.latency_ms);
+          currentData.summary = {
+            min_ms: latencies.length ? Math.min(...latencies) : null,
+            median_ms: calculateMedian(latencies),
+          };
+        }
         const tested = msg.tested;
-        const total = msg.total || currentData.total;
-        const avail = currentData.models.filter(m => m.available);
-        currentData.available = avail.length;
-        currentData.ready = avail.filter(m => !currentData.max_latency || m.latency_ms <= currentData.max_latency).length;
-        const latencies = avail.map(m => m.latency_ms);
-        currentData.summary = {
-          min_ms: latencies.length ? Math.min(...latencies) : null,
-          median_ms: calculateMedian(latencies),
-        };
+        const total = msg.total || (isRetest ? targetModels.length : currentData.total);
         const pct = total ? Math.round((tested / total) * 100) : 0;
-        status.textContent = `Menguji model (${tested}/${total})...`;
+        status.textContent = isRetest
+          ? `Menguji ulang model (${tested}/${total})...`
+          : `Menguji model (${tested}/${total})...`;
         document.getElementById('progress').textContent = `${pct}% (${tested}/${total})`;
         if (progressBar) progressBar.style.width = `${pct}%`;
         showSummary(currentData);
         renderRows();
       } else if (msg.type === 'done') {
-        currentData = msg.data;
-        if (progressBar) progressBar.style.width = '100%';
-        document.getElementById('progress').textContent = `100% (${currentData.total}/${currentData.total})`;
-        render(currentData);
-        status.textContent = `Selesai pada ${currentData.checked_at}`;
-        saveToHistory(currentData);
+        if (isRetest) {
+          recomputeDataStats(currentData);
+          currentData.checked_at = timeStampNow();
+          if (progressBar) progressBar.style.width = '100%';
+          document.getElementById('progress').textContent = `100% (${targetModels.length}/${targetModels.length})`;
+          render(currentData);
+          status.textContent = `Selesai menguji ulang ${targetModels.length} model.`;
+          saveToHistory(currentData);
+        } else {
+          currentData = msg.data;
+          if (progressBar) progressBar.style.width = '100%';
+          document.getElementById('progress').textContent = `100% (${currentData.total}/${currentData.total})`;
+          render(currentData);
+          status.textContent = `Selesai pada ${currentData.checked_at}`;
+          saveToHistory(currentData);
+        }
       }
     };
 
@@ -890,10 +1033,11 @@ async function runCheck() {
       status.textContent = error.message;
     }
   } finally {
+    isChecking = false;
     progressWrap.classList.remove('active', 'indeterminate');
     if (progressBar) progressBar.style.width = '0%';
     button.textContent = 'Cek semua model';
-    button.onclick = runCheck;
+    button.onclick = () => runCheck();
   }
 }
 function render(data) {
